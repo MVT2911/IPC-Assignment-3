@@ -67,33 +67,28 @@ double adaptive_simpson_hybrid(int id, double a, double b, double tol, double wh
     return left_res + right_res;
 }
 
-
 int main(int argc, char** argv) {
-    MPI_Init(&argc, &argv); 
     int rank, size;
+    MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
     if (argc < 4) {
-        if (rank == 0) printf("Usage: mpirun -np P integration func_id mode tol\n");
+        if (rank == 0) printf("Usage: mpirun -np P ./integration func_id mode tol\n"); 
         MPI_Finalize();
         return 0;
     }
 
-    int func_id = atoi(argv[1]);
-    int mode = atoi(argv[2]);
-    double tol = atof(argv[3]);
-    double total_integral = 0;
-    int total_intervals = 0;
-    double start_time, end_time;
+    int func_id = atoi(argv[1]); 
+    int mode = atoi(argv[2]);    
+    double tol = atof(argv[3]);  
 
-    start_time = MPI_Wtime(); 
+    double start_time = MPI_Wtime(); 
 
-    // --- MODE 0: SERIAL BASELINE --- 
-    if (mode == 0) {
-        if (rank == 0) {
-            total_integral = adaptive_recursive(func_id, 0, 1, tol, &total_intervals);
-        }
+    /* MODE 0: SERIAL BASELINE */
+    if (mode == 0 && rank == 0) {
+        double res = adaptive_simpson_serial(func_id, 0, 1, tol, simpson(func_id, 0, 1)); 
+        printf("Result: %.12f, Time: %f\n", res, MPI_Wtime() - start_time);
     }
 
     // --- MODE 1: STATIC DECOMPOSITION --- 
