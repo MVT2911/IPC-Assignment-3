@@ -145,90 +145,38 @@ int main(int argc, char** argv) {
         }
     }
 
-    // --- MODE 2: DYNAMIC MASTER/WORKER --- 
+/* MODE 2: HYBRID */
     else if (mode == 2) {
-        if (rank == 0) { // MASTER 
-            Task stack[20000]; 
-            int top = 0;
-            int active_workers = 0;
-
-            // Initial task [0, 1] 
-            stack[top++] = (Task){0.0, 1.0};
-
-            while (top > 0 || active_workers > 0) { // Termination detection logic 
-                MPI_Status status;
-                double msg_buffer[2]; 
-                MPI_Recv(msg_buffer, 2, MPI_DOUBLE, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
-                int worker = status.MPI_SOURCE;
-
-                if (status.MPI_TAG == TAG_WORK_REQ) {
-                    if (top > 0) {
-                        Task t = stack[--top];
-                        MPI_Send(&t, sizeof(Task), MPI_BYTE, worker, TAG_WORK_TASK, MPI_COMM_WORLD);
-                        active_workers++;
-                    } else {
-                        // Queue empty, but other workers might still be generating tasks
-                        MPI_Send(NULL, 0, MPI_BYTE, worker, TAG_TERMINATE, MPI_COMM_WORLD);
-                    }
-                } 
-                else if (status.MPI_TAG == TAG_RESULT) {
-                    total_integral += msg_buffer[0];
-                    total_intervals += (int)msg_buffer[1];
-                    active_workers--;
-                }
-                else if (status.MPI_TAG == TAG_NEW_TASK) {
-                    stack[top++] = (Task){msg_buffer[0], msg_buffer[1]};
-                }
+        double hybrid_local_sum = 0;
+        if (rank == 0) {
+            int K = 100; // Static distribution 
+            for (int i = 0; i < K; i++) {
+                double range[2] = {(double)i/K, (double)(i+1)/K};
+                int dest = (i % (size - 1)) + 1; 
+                MPI_Send(range, 2, MPI_DOUBLE, dest, TAG_WORK, MPI_COMM_WORLD);
             }
-            // Signal all workers to shut down permanently 
-            for (int i = 1; i < size; i++) {
-                MPI_Send(NULL, 0, MPI_BYTE, i, TAG_TERMINATE, MPI_COMM_WORLD);
-            }
-        }
-        else { // WORKER 
+            for (int i = 1; i < size; i++) MPI_Send(NULL, 0, MPI_DOUBLE, i, TAG_STOP, MPI_COMM_WORLD);
+        } else {
+            double range[2]; MPI_Status status;
             while (1) {
-                MPI_Send(NULL, 0, MPI_BYTE, 0, TAG_WORK_REQ, MPI_COMM_WORLD); // 1. Request work 
-                
-                Task t;
-                MPI_Status status;
-                MPI_Recv(&t, sizeof(Task), MPI_BYTE, 0, MPI_ANY_TAG, MPI_COMM_WORLD, &status); // 2. Receive 
-
-                if (status.MPI_TAG == TAG_TERMINATE) break; // End signal 
-
-                // 3. Apply adaptive logic 
-                double m = (t.L + t.R) / 2.0;
-                double left_s = simpson(func_id, t.L, m);
-                double right_s = simpson(func_id, m, t.R);
-                double whole_s = simpson(func_id, t.L, t.R);
-
-                if (fabs(left_s + right_s - whole_s) <= 15 * tol) {
-                    // Accepted result 
-                    double res[2] = {left_s + right_s + (left_s + right_s - whole_s) / 15.0, 1.0};
-                    MPI_Send(res, 2, MPI_DOUBLE, 0, TAG_RESULT, MPI_COMM_WORLD); 
-                } else {
-                    // Split 
-                    double new_task[2] = {m, t.R}; 
-                    MPI_Send(new_task, 2, MPI_DOUBLE, 0, TAG_NEW_TASK, MPI_COMM_WORLD); // Send half back 
-                    
-                    // Worker handles the other half immediately to stay busy 
-                    // (Simplified logic: push back to master for this assignment version)
-                    double left_task[2] = {t.L, m};
-                    MPI_Send(left_task, 2, MPI_DOUBLE, 0, TAG_NEW_TASK, MPI_COMM_WORLD);
-                    
-                    // Reset active_worker count for this worker since it's "done" with the original task
-                    double zero_res[2] = {0, 0};
-                    MPI_Send(zero_res, 2, MPI_DOUBLE, 0, TAG_RESULT, MPI_COMM_WORLD);
+                MPI_Recv(range, 2, MPI_DOUBLE, 0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+                if (status.MPI_TAG == TAG_STOP) break;
+                #pragma omp parallel
+                {
+                    #pragma omp single
+                    hybrid_local_sum += adaptive_simpson_hybrid(func_id, range[0], range[1], tol, simpson(func_id, range[0], range[1]), &local_intervals);
                 }
             }
         }
+        MPI_Reduce(&hybrid_local_sum, &final_integral, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&local_intervals, &total_intervals, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
     }
 
-    end_time = MPI_Wtime();
-
     if (rank == 0) {
+        double end_time = MPI_Wtime();
         printf("\n--- Results (Mode %d) ---\n", mode);
-        printf("Integral: %.10f\n", total_integral);
-        printf("Total Intervals: %d\n", total_intervals); // Deterministic work indicator 
+        printf("Integral: %.10f\n", final_integral);
+        printf("Total Intervals: %d\n", total_intervals); 
         printf("Function ID: %d\n", func_id);
         printf("Error Tolerance: %.10f\n", tol);
         printf("Execution Time: %f seconds\n", end_time - start_time);
