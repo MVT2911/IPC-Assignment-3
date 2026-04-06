@@ -2,20 +2,20 @@
 #include <stdlib.h>
 #include <math.h>
 #include <mpi.h>
+#include <omp.h>
 
-// MPI Tags for communication 
-#define TAG_WORK_REQ    1  // Worker requesting work
-#define TAG_WORK_TASK   2  // Master sending an interval
-#define TAG_RESULT      3  // Worker sending partial integral
-#define TAG_NEW_TASK    4  // Worker sending a split sub-interval back
-#define TAG_TERMINATE   0  // Master telling worker to stop 
+#define TAG_WORK 1
+#define TAG_RESULT 2
+#define TAG_STOP 3
 
-typedef struct {
-    double L, R;
-} Task;
+// Function Prototypes
+double get_func(int id, double x);
+double simpson(int id, double a, double b);
+double adaptive_simpson_serial(int id, double a, double b, double tol, double whole);
+double adaptive_simpson_hybrid(int id, double a, double b, double tol, double whole);
 
-// Function definitions as per assignment requirements 
-double f(int id, double x) {
+// Function Definitions 
+double get_func(int id, double x) {
     switch(id) {
         case 0: return sin(x) + 0.5 * cos(3 * x);
         case 1: return 1.0 / (1.0 + 100.0 * pow(x - 0.3, 2));
@@ -24,10 +24,9 @@ double f(int id, double x) {
     }
 }
 
-// Standard Simpson's Rule over [a, b]
 double simpson(int id, double a, double b) {
-    double m = (a + b) / 2.0;
-    return ((b - a) / 6.0) * (f(id, a) + 4 * f(id, m) + f(id, b));
+    double c = (a + b) / 2.0;
+    return (fabs(b - a) / 6.0) * (get_func(id, a) + 4.0 * get_func(id, c) + get_func(id, b));
 }
 
 // Core Adaptive Logic used by all modes
