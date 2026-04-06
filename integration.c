@@ -14,38 +14,42 @@
 /* Function Prototypes */
 double get_func(int id, double x);
 double simpson(int id, double a, double b);
-double adaptive_simpson_serial(int id, double a, double b, double tol, double whole);
-double adaptive_simpson_hybrid(int id, double a, double b, double tol, double whole);
+double adaptive_simpson_serial(int id, double a, double b, double tol, double whole, int *intervals);
+double adaptive_simpson_hybrid(int id, double a, double b, double tol, double whole, int *intervals);
 
-/* Numerical Integration Functions */
+/* Supported Functions */
 double get_func(int id, double x) {
     switch(id) {
         case 0: return sin(x) + 0.5 * cos(3 * x);
-        case 1: return 1.0 / (1.0 + 100.0 * pow(x - 0.3, 2)); 
-        case 2: return sin(200 * x) * exp(-x); 
+        case 1: return 1.0 / (1.0 + 100.0 * pow(x - 0.3, 2));
+        case 2: return sin(200 * x) * exp(-x);
         default: return 0;
     }
 }
 
 double simpson(int id, double a, double b) {
     double c = (a + b) / 2.0;
-    return (fabs(b - a) / 6.0) * (get_func(id, a) + 4.0 * get_func(id, c) + get_func(id, b)); 
+    return (fabs(b - a) / 6.0) * (get_func(id, a) + 4.0 * get_func(id, c) + get_func(id, b));
 }
 
-/* Mode 0: Serial Implementation */
-double adaptive_simpson_serial(int id, double a, double b, double tol, double whole) {
+/* Mode 0: Serial */
+double adaptive_simpson_serial(int id, double a, double b, double tol, double whole, int *intervals) {
+    (*intervals)++;
     double m = (a + b) / 2.0;
     double left = simpson(id, a, m);
     double right = simpson(id, m, b);
-    if (fabs(whole - (left + right)) <= 15 * tol) { 
+    if (fabs(whole - (left + right)) <= 15 * tol) {
         return left + right + (whole - (left + right)) / 15.0;
     }
-    return adaptive_simpson_serial(id, a, m, tol / 2.0, left) + 
-           adaptive_simpson_serial(id, m, b, tol / 2.0, right); 
+    return adaptive_simpson_serial(id, a, m, tol / 2.0, left, intervals) + 
+           adaptive_simpson_serial(id, m, b, tol / 2.0, right, intervals);
 }
 
-/* Mode 2: Hybrid OpenMP Task Implementation */
-double adaptive_simpson_hybrid(int id, double a, double b, double tol, double whole) {
+/* Mode 2: Hybrid OpenMP Tasks */
+double adaptive_simpson_hybrid(int id, double a, double b, double tol, double whole, int *intervals) {
+    #pragma omp atomic
+    (*intervals)++;
+
     double m = (a + b) / 2.0;
     double left_s = simpson(id, a, m);
     double right_s = simpson(id, m, b);
@@ -55,13 +59,11 @@ double adaptive_simpson_hybrid(int id, double a, double b, double tol, double wh
     }
 
     double left_res, right_res;
-    
-    /* Parallelize recursion using OpenMP tasks */
-    #pragma omp task shared(left_res) 
-    left_res = adaptive_simpson_hybrid(id, a, m, tol / 2.0, left_s);
+    #pragma omp task shared(left_res)
+    left_res = adaptive_simpson_hybrid(id, a, m, tol / 2.0, left_s, intervals);
 
     #pragma omp task shared(right_res)
-    right_res = adaptive_simpson_hybrid(id, m, b, tol / 2.0, right_s);
+    right_res = adaptive_simpson_hybrid(id, m, b, tol / 2.0, right_s, intervals);
 
     #pragma omp taskwait
     return left_res + right_res;
@@ -74,31 +76,32 @@ int main(int argc, char** argv) {
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
     if (argc < 4) {
-        if (rank == 0) printf("Usage: mpirun -np P ./integration func_id mode tol\n"); 
+        if (rank == 0) printf("Usage: mpirun -np P ./integration func_id mode tol\n");
         MPI_Finalize();
         return 0;
     }
 
-    int func_id = atoi(argv[1]); 
-    int mode = atoi(argv[2]);    
-    double tol = atof(argv[3]);  
+    int func_id = atoi(argv[1]);
+    int mode = atoi(argv[2]);   
+    double tol = atof(argv[3]); 
+    int local_intervals = 0;
+    double final_integral = 0;
+    int total_intervals = 0;
 
-    double start_time = MPI_Wtime(); 
+    double start_time = MPI_Wtime();
 
-    /* MODE 0: SERIAL BASELINE */
+    /* MODE 0: SERIAL */
     if (mode == 0 && rank == 0) {
-        double res = adaptive_simpson_serial(func_id, 0, 1, tol, simpson(func_id, 0, 1)); 
-        printf("Result: %.12f, Time: %f\n", res, MPI_Wtime() - start_time);
-    }
+        final_integral = adaptive_simpson_serial(func_id, 0, 1, tol, simpson(func_id, 0, 1), &local_intervals);
+        total_intervals = local_intervals;
+    } 
 
-/* MODE 1: MPI DYNAMIC MASTER/WORKER */
+    /* MODE 1: MPI DYNAMIC */
     else if (mode == 1) {
         if (rank == 0) {
-            double total_integral = 0;
             int active_workers = 0;
-            double stack[2000][2]; /
+            double stack[10000][2]; 
             int top = -1;
-
             stack[++top][0] = 0.0; stack[top][1] = 1.0;
 
             while (top >= 0 || active_workers > 0) {
@@ -110,46 +113,46 @@ int main(int argc, char** argv) {
                     MPI_Send(stack[top--], 2, MPI_DOUBLE, status.MPI_SOURCE, TAG_WORK, MPI_COMM_WORLD);
                     active_workers++;
                 } else if (status.MPI_TAG == TAG_RESULT) {
-                    total_integral += msg[0];
+                    final_integral += msg[0];
+                    local_intervals += (int)msg[1];
                     active_workers--;
-                } else if (status.MPI_TAG == TAG_NEW_TASK) { 
+                } else if (status.MPI_TAG == TAG_NEW_TASK) {
                     stack[++top][0] = msg[0]; stack[top][1] = msg[1];
                 }
             }
             for (int i = 1; i < size; i++) MPI_Send(NULL, 0, MPI_DOUBLE, i, TAG_STOP, MPI_COMM_WORLD);
-            printf("Mode 1 Result: %.12f, Time: %f\n", total_integral, MPI_Wtime() - start_time);
+            total_intervals = local_intervals;
         } else {
-            /* Worker logic for Mode 1 */
             while (1) {
                 double range[2]; MPI_Status status;
-                MPI_Send(NULL, 0, MPI_DOUBLE, 0, TAG_WORK_REQ, MPI_COMM_WORLD); 
+                MPI_Send(NULL, 0, MPI_DOUBLE, 0, TAG_WORK_REQ, MPI_COMM_WORLD);
                 MPI_Recv(range, 2, MPI_DOUBLE, 0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
                 if (status.MPI_TAG == TAG_STOP) break;
 
                 double m = (range[0] + range[1]) / 2.0;
                 double w = simpson(func_id, range[0], range[1]);
                 double l = simpson(func_id, range[0], m), r = simpson(func_id, m, range[1]);
-
+                
+                int intervals_counted = 1;
                 if (fabs(w - (l + r)) <= 15 * tol) {
-                    double res = l + r + (w - (l + r)) / 15.0;
-                    MPI_Send(&res, 1, MPI_DOUBLE, 0, TAG_RESULT, MPI_COMM_WORLD);
+                    double res[2] = {l + r + (w - (l + r)) / 15.0, (double)intervals_counted};
+                    MPI_Send(res, 2, MPI_DOUBLE, 0, TAG_RESULT, MPI_COMM_WORLD);
                 } else {
-                    double task[2] = {m, range[1]};
-                    MPI_Send(task, 2, MPI_DOUBLE, 0, TAG_NEW_TASK, MPI_COMM_WORLD); 
-                    /* Process other half locally or send back */
-                    double task2[2] = {range[0], m};
-                    MPI_Send(task2, 2, MPI_DOUBLE, 0, TAG_NEW_TASK, MPI_COMM_WORLD);
-                    double dummy = 0; MPI_Send(&dummy, 1, MPI_DOUBLE, 0, TAG_RESULT, MPI_COMM_WORLD);
+                    double t1[2] = {m, range[1]}, t2[2] = {range[0], m};
+                    MPI_Send(t1, 2, MPI_DOUBLE, 0, TAG_NEW_TASK, MPI_COMM_WORLD);
+                    MPI_Send(t2, 2, MPI_DOUBLE, 0, TAG_NEW_TASK, MPI_COMM_WORLD);
+                    double res[2] = {0, (double)intervals_counted};
+                    MPI_Send(res, 2, MPI_DOUBLE, 0, TAG_RESULT, MPI_COMM_WORLD);
                 }
             }
         }
     }
 
-/* MODE 2: HYBRID */
+    /* MODE 2: HYBRID */
     else if (mode == 2) {
         double hybrid_local_sum = 0;
         if (rank == 0) {
-            int K = 100; // Static distribution 
+            int K = 100; // Static distribution
             for (int i = 0; i < K; i++) {
                 double range[2] = {(double)i/K, (double)(i+1)/K};
                 int dest = (i % (size - 1)) + 1; 
