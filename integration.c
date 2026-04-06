@@ -1,49 +1,70 @@
+#include <mpi.h>
+#include <omp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include <mpi.h>
-#include <omp.h>
 
-#define TAG_WORK 1
-#define TAG_RESULT 2
-#define TAG_STOP 3
+/* Message Tags */
+#define TAG_WORK        1
+#define TAG_RESULT      2
+#define TAG_NEW_TASK    3
+#define TAG_STOP        4
+#define TAG_WORK_REQ    5
 
-// Function Prototypes
+/* Function Prototypes */
 double get_func(int id, double x);
 double simpson(int id, double a, double b);
 double adaptive_simpson_serial(int id, double a, double b, double tol, double whole);
 double adaptive_simpson_hybrid(int id, double a, double b, double tol, double whole);
 
-// Function Definitions 
+/* Numerical Integration Functions */
 double get_func(int id, double x) {
     switch(id) {
         case 0: return sin(x) + 0.5 * cos(3 * x);
-        case 1: return 1.0 / (1.0 + 100.0 * pow(x - 0.3, 2));
-        case 2: return sin(200 * x) * exp(-x);
+        case 1: return 1.0 / (1.0 + 100.0 * pow(x - 0.3, 2)); 
+        case 2: return sin(200 * x) * exp(-x); 
         default: return 0;
     }
 }
 
 double simpson(int id, double a, double b) {
     double c = (a + b) / 2.0;
-    return (fabs(b - a) / 6.0) * (get_func(id, a) + 4.0 * get_func(id, c) + get_func(id, b));
+    return (fabs(b - a) / 6.0) * (get_func(id, a) + 4.0 * get_func(id, c) + get_func(id, b)); 
 }
 
-// Core Adaptive Logic used by all modes
-double adaptive_recursive(int id, double a, double b, double tol, int *count) {
+/* Mode 0: Serial Implementation */
+double adaptive_simpson_serial(int id, double a, double b, double tol, double whole) {
+    double m = (a + b) / 2.0;
+    double left = simpson(id, a, m);
+    double right = simpson(id, m, b);
+    if (fabs(whole - (left + right)) <= 15 * tol) { 
+        return left + right + (whole - (left + right)) / 15.0;
+    }
+    return adaptive_simpson_serial(id, a, m, tol / 2.0, left) + 
+           adaptive_simpson_serial(id, m, b, tol / 2.0, right); 
+}
+
+/* Mode 2: Hybrid OpenMP Task Implementation */
+double adaptive_simpson_hybrid(int id, double a, double b, double tol, double whole) {
     double m = (a + b) / 2.0;
     double left_s = simpson(id, a, m);
     double right_s = simpson(id, m, b);
-    double whole_s = simpson(id, a, b);
 
-    // If the difference is within tolerance, accept 
-    if (fabs(left_s + right_s - whole_s) <= 15 * tol) {
-        (*count)++;
-        return left_s + right_s + (left_s + right_s - whole_s) / 15.0;
+    if (fabs(whole - (left_s + right_s)) <= 15 * tol) {
+        return left_s + right_s + (whole - (left_s + right_s)) / 15.0;
     }
-    // Otherwise, split and continue 
-    return adaptive_recursive(id, a, m, tol/2.0, count) + 
-           adaptive_recursive(id, m, b, tol/2.0, count);
+
+    double left_res, right_res;
+    
+    /* Parallelize recursion using OpenMP tasks */
+    #pragma omp task shared(left_res) 
+    left_res = adaptive_simpson_hybrid(id, a, m, tol / 2.0, left_s);
+
+    #pragma omp task shared(right_res)
+    right_res = adaptive_simpson_hybrid(id, m, b, tol / 2.0, right_s);
+
+    #pragma omp taskwait
+    return left_res + right_res;
 }
 
 
