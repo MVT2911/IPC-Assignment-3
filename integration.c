@@ -91,19 +91,58 @@ int main(int argc, char** argv) {
         printf("Result: %.12f, Time: %f\n", res, MPI_Wtime() - start_time);
     }
 
-    // --- MODE 1: STATIC DECOMPOSITION --- 
+/* MODE 1: MPI DYNAMIC MASTER/WORKER */
     else if (mode == 1) {
-        int K = 100; // Chosen value for K coarse intervals 
-        double step = 1.0 / K;
-        double local_sum = 0;
-        int local_count = 0;
+        if (rank == 0) {
+            double total_integral = 0;
+            int active_workers = 0;
+            double stack[2000][2]; /
+            int top = -1;
 
-        for (int i = rank; i < K; i += size) { // Round-robin distribution 
-            local_sum += adaptive_recursive(func_id, i*step, (i+1)*step, tol/K, &local_count);
+            stack[++top][0] = 0.0; stack[top][1] = 1.0;
+
+            while (top >= 0 || active_workers > 0) {
+                MPI_Status status;
+                double msg[3];
+                MPI_Recv(msg, 3, MPI_DOUBLE, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+
+                if (status.MPI_TAG == TAG_WORK_REQ && top >= 0) {
+                    MPI_Send(stack[top--], 2, MPI_DOUBLE, status.MPI_SOURCE, TAG_WORK, MPI_COMM_WORLD);
+                    active_workers++;
+                } else if (status.MPI_TAG == TAG_RESULT) {
+                    total_integral += msg[0];
+                    active_workers--;
+                } else if (status.MPI_TAG == TAG_NEW_TASK) { 
+                    stack[++top][0] = msg[0]; stack[top][1] = msg[1];
+                }
+            }
+            for (int i = 1; i < size; i++) MPI_Send(NULL, 0, MPI_DOUBLE, i, TAG_STOP, MPI_COMM_WORLD);
+            printf("Mode 1 Result: %.12f, Time: %f\n", total_integral, MPI_Wtime() - start_time);
+        } else {
+            /* Worker logic for Mode 1 */
+            while (1) {
+                double range[2]; MPI_Status status;
+                MPI_Send(NULL, 0, MPI_DOUBLE, 0, TAG_WORK_REQ, MPI_COMM_WORLD); 
+                MPI_Recv(range, 2, MPI_DOUBLE, 0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+                if (status.MPI_TAG == TAG_STOP) break;
+
+                double m = (range[0] + range[1]) / 2.0;
+                double w = simpson(func_id, range[0], range[1]);
+                double l = simpson(func_id, range[0], m), r = simpson(func_id, m, range[1]);
+
+                if (fabs(w - (l + r)) <= 15 * tol) {
+                    double res = l + r + (w - (l + r)) / 15.0;
+                    MPI_Send(&res, 1, MPI_DOUBLE, 0, TAG_RESULT, MPI_COMM_WORLD);
+                } else {
+                    double task[2] = {m, range[1]};
+                    MPI_Send(task, 2, MPI_DOUBLE, 0, TAG_NEW_TASK, MPI_COMM_WORLD); 
+                    /* Process other half locally or send back */
+                    double task2[2] = {range[0], m};
+                    MPI_Send(task2, 2, MPI_DOUBLE, 0, TAG_NEW_TASK, MPI_COMM_WORLD);
+                    double dummy = 0; MPI_Send(&dummy, 1, MPI_DOUBLE, 0, TAG_RESULT, MPI_COMM_WORLD);
+                }
+            }
         }
-
-        MPI_Reduce(&local_sum, &total_integral, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD); 
-        MPI_Reduce(&local_count, &total_intervals, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
     }
 
     // --- MODE 2: DYNAMIC MASTER/WORKER --- 
